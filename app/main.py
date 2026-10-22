@@ -1,18 +1,28 @@
+import asyncio
+import logging
 import os
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse
+
+from app.ai import get_ai_reply
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+WHATSAPP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+WHATSAPP_SEND_ATTEMPTS = 2
+WHATSAPP_RETRY_DELAY_SECONDS = 1
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 app = FastAPI()
+processed_message_ids: set[str] = set()
 
 
 @app.get("/")
@@ -48,15 +58,51 @@ async def send_whatsapp_message(to: str, message: str) -> None:
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": f"You said: {message}"},
+        "text": {"body": message},
     }
     async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=body)
-    print(response.status_code, response.text)
+        for attempt in range(WHATSAPP_SEND_ATTEMPTS):
+            try:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=WHATSAPP_TIMEOUT,
+                )
+                response.raise_for_status()
+                return
+            except httpx.HTTPStatusError as error:
+                logger.error(
+                    "WhatsApp rejected the message with status %s: %s",
+                    error.response.status_code,
+                    error.response.text,
+                )
+                return
+            except httpx.RequestError:
+                if attempt + 1 == WHATSAPP_SEND_ATTEMPTS:
+                    logger.exception(
+                        "WhatsApp message delivery failed after %s attempts",
+                        WHATSAPP_SEND_ATTEMPTS,
+                    )
+                    return
+                logger.warning(
+                    "WhatsApp connection failed; retrying in %s second",
+                    WHATSAPP_RETRY_DELAY_SECONDS,
+                    exc_info=True,
+                )
+                await asyncio.sleep(WHATSAPP_RETRY_DELAY_SECONDS)
+
+
+async def process_incoming_message(sender: str, text: str) -> None:
+    reply = await get_ai_reply(text)
+    await send_whatsapp_message(sender, reply)
 
 
 @app.post("/webhook")
-async def receive_webhook(request: Request) -> dict[str, str]:
+async def receive_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
     payload: Any = await request.json()
     entries = payload.get("entry") if isinstance(payload, dict) else None
     if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
@@ -75,6 +121,10 @@ async def receive_webhook(request: Request) -> dict[str, str]:
         return {"status": "ok"}
 
     message = messages[0]
+    message_id = message.get("id")
+    if not isinstance(message_id, str) or message_id in processed_message_ids:
+        return {"status": "ok"}
+
     if message.get("type") != "text":
         return {"status": "ok"}
 
@@ -86,5 +136,6 @@ async def receive_webhook(request: Request) -> dict[str, str]:
     if not isinstance(text_body, str):
         return {"status": "ok"}
 
-    await send_whatsapp_message(sender, text_body)
+    processed_message_ids.add(message_id)
+    background_tasks.add_task(process_incoming_message, sender, text_body)
     return {"status": "ok"}
