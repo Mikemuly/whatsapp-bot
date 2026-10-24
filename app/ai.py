@@ -1,9 +1,13 @@
+import asyncio
 import logging
 import os
+from typing import Literal, TypedDict
 
 from google import genai
 from google.genai import types
 from groq import AsyncGroq
+
+from rag import format_context, retrieve_relevant_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -12,15 +16,33 @@ GROQ_DEFAULT_MODEL = "qwen/qwen3.8-27b"
 REQUEST_TIMEOUT_MS = 9000
 GROQ_TIMEOUT_SECONDS = 9.0
 SYSTEM_INSTRUCTION = (
-    "You are a helpful WhatsApp assistant. Keep your replies concise, "
-    "friendly, and easy to understand."
+    "You provide concise information about the Constitution of Kenya, 2010. "
+    "Answer only from the provided excerpts; never use outside knowledge or "
+    "guess. Cite every factual claim with its Article and clause when "
+    "available. If the excerpts do not answer the question, say that the "
+    "Constitution excerpts do not provide the answer. Reply in the user's "
+    "language (English or Swahili), keep citations in their original form, "
+    "and keep the answer short for WhatsApp. End with: "
+    "This is information, not legal advice."
 )
 FALLBACK_REPLY = (
     "Sorry, I'm having trouble responding right now. Please try again later."
 )
+INDEX_UNAVAILABLE_REPLY = (
+    "I can't access the Constitution reference right now. Please try again "
+    "later. This is information, not legal advice."
+)
 
 
-async def ask_gemini(user_text: str) -> str:
+class ConversationMessage(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+async def ask_gemini(
+    user_text: str,
+    history: list[ConversationMessage] | None = None,
+) -> str:
     client: genai.Client | None = None
     try:
         client = genai.Client(
@@ -30,9 +52,17 @@ async def ask_gemini(user_text: str) -> str:
                 retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
+        contents = [
+            {
+                "role": "model" if message["role"] == "assistant" else "user",
+                "parts": [{"text": message["content"]}],
+            }
+            for message in history or []
+        ]
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
-            contents=user_text,
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION
             ),
@@ -51,9 +81,20 @@ async def ask_gemini(user_text: str) -> str:
                 logger.exception("Failed to close the Gemini client")
 
 
-async def ask_groq(user_text: str) -> str:
+async def ask_groq(
+    user_text: str,
+    history: list[ConversationMessage] | None = None,
+) -> str:
     try:
         model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL)
+        messages = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            *[
+                {"role": message["role"], "content": message["content"]}
+                for message in history or []
+            ],
+            {"role": "user", "content": user_text},
+        ]
         async with AsyncGroq(
             api_key=os.getenv("GROQ_API_KEY"),
             timeout=GROQ_TIMEOUT_SECONDS,
@@ -61,10 +102,7 @@ async def ask_groq(user_text: str) -> str:
         ) as client:
             completion = await client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTION},
-                    {"role": "user", "content": user_text},
-                ],
+                messages=messages,
             )
         reply = completion.choices[0].message.content
         if not reply:
@@ -75,12 +113,25 @@ async def ask_groq(user_text: str) -> str:
         return FALLBACK_REPLY
 
 
-async def get_ai_reply(user_text: str) -> str:
+async def get_ai_reply(
+    user_text: str,
+    history: list[ConversationMessage] | None = None,
+) -> str:
+    try:
+        retrieved_chunks = await asyncio.to_thread(
+            retrieve_relevant_chunks,
+            user_text,
+        )
+    except Exception:
+        logger.exception("Failed to retrieve Constitution excerpts")
+        return INDEX_UNAVAILABLE_REPLY
+
+    prompt = format_context(user_text, retrieved_chunks)
     provider = os.getenv("AI_PROVIDER", "groq").strip().lower()
     if provider == "groq":
-        return await ask_groq(user_text)
+        return await ask_groq(prompt, history)
     if provider == "gemini":
-        return await ask_gemini(user_text)
+        return await ask_gemini(prompt, history)
 
     logger.error("Unsupported AI_PROVIDER: %s", provider)
     return FALLBACK_REPLY

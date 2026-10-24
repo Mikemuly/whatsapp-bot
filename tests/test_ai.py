@@ -25,7 +25,10 @@ class GetAIReplyTests(unittest.IsolatedAsyncioTestCase):
         client.aio.models.generate_content.assert_awaited_once()
         call = client.aio.models.generate_content.call_args
         self.assertEqual(call.kwargs["model"], ai.GEMINI_MODEL)
-        self.assertEqual(call.kwargs["contents"], "Hi")
+        self.assertEqual(
+            call.kwargs["contents"],
+            [{"role": "user", "parts": [{"text": "Hi"}]}],
+        )
         self.assertEqual(
             call.kwargs["config"].system_instruction,
             ai.SYSTEM_INSTRUCTION,
@@ -67,9 +70,80 @@ class GetAIReplyTests(unittest.IsolatedAsyncioTestCase):
         )
         client.__aexit__.assert_awaited_once()
 
+    @patch("app.ai.AsyncGroq")
+    async def test_ask_groq_includes_prior_conversation(self, groq_factory):
+        client = groq_factory.return_value
+        client.__aenter__.return_value = client
+        client.chat.completions.create = AsyncMock(
+            return_value=Mock(
+                choices=[Mock(message=Mock(content="Continuing reply"))]
+            )
+        )
+
+        history = [
+            {"role": "user", "content": "My name is Alex."},
+            {"role": "assistant", "content": "Nice to meet you, Alex."},
+        ]
+        reply = await ai.ask_groq("What is my name?", history)
+
+        self.assertEqual(reply, "Continuing reply")
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs["messages"],
+            [
+                {"role": "system", "content": ai.SYSTEM_INSTRUCTION},
+                *history,
+                {"role": "user", "content": "What is my name?"},
+            ],
+        )
+        client.__aexit__.assert_awaited_once()
+
+    @patch("app.ai.genai.Client")
+    async def test_ask_gemini_converts_prior_conversation(self, client_factory):
+        client = client_factory.return_value
+        client.aio.models.generate_content = AsyncMock(
+            return_value=Mock(text="Your name is Alex.")
+        )
+        client.aio.aclose = AsyncMock()
+        history = [
+            {"role": "user", "content": "My name is Alex."},
+            {"role": "assistant", "content": "Nice to meet you, Alex."},
+        ]
+
+        reply = await ai.ask_gemini("What is my name?", history)
+
+        self.assertEqual(reply, "Your name is Alex.")
+        self.assertEqual(
+            client.aio.models.generate_content.call_args.kwargs["contents"],
+            [
+                {"role": "user", "parts": [{"text": "My name is Alex."}]},
+                {
+                    "role": "model",
+                    "parts": [{"text": "Nice to meet you, Alex."}],
+                },
+                {"role": "user", "parts": [{"text": "What is my name?"}]},
+            ],
+        )
+
     async def test_dispatches_to_selected_provider(self):
         with (
             patch.dict(os.environ, {"AI_PROVIDER": "groq"}),
+            patch(
+                "app.ai.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=[
+                    {
+                        "text": "Article 43 excerpt",
+                        "article": "43",
+                        "title": "Economic and social rights",
+                        "chapter": "Four - The Bill of Rights",
+                        "clause": "1",
+                    }
+                ],
+            ) as retrieve,
+            patch(
+                "app.ai.format_context",
+                return_value="Question with Article 43 context",
+            ) as format_context,
             patch(
                 "app.ai.ask_groq",
                 new_callable=AsyncMock,
@@ -80,11 +154,31 @@ class GetAIReplyTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as ask_gemini,
         ):
-            reply = await ai.get_ai_reply("Hi")
+            reply = await ai.get_ai_reply("Hi", [{"role": "user", "content": "Earlier"}])
 
         self.assertEqual(reply, "Groq reply")
-        ask_groq.assert_awaited_once_with("Hi")
+        retrieve.assert_awaited_once_with(ai.retrieve_relevant_chunks, "Hi")
+        format_context.assert_called_once()
+        ask_groq.assert_awaited_once_with(
+            "Question with Article 43 context",
+            [{"role": "user", "content": "Earlier"}],
+        )
         ask_gemini.assert_not_awaited()
+
+    async def test_returns_clear_reply_when_constitution_index_unavailable(self):
+        with (
+            patch(
+                "app.ai.asyncio.to_thread",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("index missing"),
+            ),
+            patch("app.ai.ask_groq", new_callable=AsyncMock) as ask_groq,
+            self.assertLogs("app.ai", level="ERROR"),
+        ):
+            reply = await ai.get_ai_reply("What is housing?")
+
+        self.assertEqual(reply, ai.INDEX_UNAVAILABLE_REPLY)
+        ask_groq.assert_not_awaited()
 
     @patch("app.ai.genai.Client")
     async def test_returns_fallback_without_retry_on_503(self, client_factory):
@@ -162,6 +256,7 @@ class WebhookReplyTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(main, "processed_message_ids", set()),
+            patch.object(main, "conversation_history", {}),
             patch(
                 "app.main.get_ai_reply",
                 new=AsyncMock(return_value="AI response"),
@@ -182,14 +277,22 @@ class WebhookReplyTests(unittest.IsolatedAsyncioTestCase):
 
             await tasks()
 
-            generate_reply.assert_awaited_once_with("Hi")
+            generate_reply.assert_awaited_once_with("Hi", [])
             send_message.assert_awaited_once_with("15551234567", "AI response")
+            self.assertEqual(
+                main.conversation_history["15551234567"],
+                [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "AI response"},
+                ],
+            )
 
     async def test_duplicate_message_id_is_scheduled_only_once(self):
         from app import main
 
         with (
             patch.object(main, "processed_message_ids", set()),
+            patch.object(main, "conversation_history", {}),
             patch(
                 "app.main.get_ai_reply",
                 new=AsyncMock(return_value="AI response"),
@@ -217,8 +320,57 @@ class WebhookReplyTests(unittest.IsolatedAsyncioTestCase):
 
             await first_tasks()
 
-            generate_reply.assert_awaited_once_with("Hi")
+            generate_reply.assert_awaited_once_with("Hi", [])
             send_message.assert_awaited_once_with("15551234567", "AI response")
+
+    async def test_conversation_history_is_capped_and_passed_to_ai(self):
+        from app import main
+
+        sender = "15551234567"
+        initial_history = [
+            {"role": "user", "content": f"old message {index}"}
+            for index in range(main.MAX_HISTORY_MESSAGES)
+        ]
+        conversation = {sender: initial_history.copy()}
+        with (
+            patch.object(main, "processed_message_ids", set()),
+            patch.object(main, "conversation_history", conversation),
+            patch(
+                "app.main.get_ai_reply",
+                new=AsyncMock(return_value="AI response"),
+            ) as generate_reply,
+            patch(
+                "app.main.send_whatsapp_message",
+                new=AsyncMock(),
+            ),
+        ):
+            tasks = BackgroundTasks()
+            response = await main.receive_webhook(
+                self.make_request("wamid.history-cap"), tasks
+            )
+
+            self.assertEqual(response, {"status": "ok"})
+            self.assertEqual(
+                generate_reply.await_count,
+                0,
+            )
+            self.assertEqual(len(conversation[sender]), main.MAX_HISTORY_MESSAGES)
+            self.assertEqual(
+                conversation[sender][-1],
+                {"role": "user", "content": "Hi"},
+            )
+
+            await tasks()
+
+        generate_reply.assert_awaited_once_with(
+            "Hi",
+            initial_history[-(main.MAX_HISTORY_MESSAGES - 1) :],
+        )
+        self.assertEqual(len(conversation[sender]), main.MAX_HISTORY_MESSAGES)
+        self.assertEqual(
+            conversation[sender][-1],
+            {"role": "assistant", "content": "AI response"},
+        )
 
 
 class WhatsAppDeliveryTests(unittest.IsolatedAsyncioTestCase):

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse
 
-from app.ai import get_ai_reply
+from app.ai import ConversationMessage, get_ai_reply
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,8 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 app = FastAPI()
 processed_message_ids: set[str] = set()
+MAX_HISTORY_MESSAGES = 10
+conversation_history: dict[str, list[ConversationMessage]] = {}
 
 
 @app.get("/")
@@ -93,8 +95,14 @@ async def send_whatsapp_message(to: str, message: str) -> None:
                 await asyncio.sleep(WHATSAPP_RETRY_DELAY_SECONDS)
 
 
-async def process_incoming_message(sender: str, text: str) -> None:
-    reply = await get_ai_reply(text)
+async def process_incoming_message(
+    sender: str,
+    text: str,
+    history: list[ConversationMessage],
+) -> None:
+    reply = await get_ai_reply(text, history)
+    conversation_history[sender].append({"role": "assistant", "content": reply})
+    del conversation_history[sender][:-MAX_HISTORY_MESSAGES]
     await send_whatsapp_message(sender, reply)
 
 
@@ -136,6 +144,20 @@ async def receive_webhook(
     if not isinstance(text_body, str):
         return {"status": "ok"}
 
+    history = conversation_history.setdefault(sender, [])
+    history_snapshot = (
+        history[-(MAX_HISTORY_MESSAGES - 1) :]
+        if MAX_HISTORY_MESSAGES > 1
+        else []
+    )
+    history.append({"role": "user", "content": text_body})
+    del history[:-MAX_HISTORY_MESSAGES]
+
     processed_message_ids.add(message_id)
-    background_tasks.add_task(process_incoming_message, sender, text_body)
+    background_tasks.add_task(
+        process_incoming_message,
+        sender,
+        text_body,
+        history_snapshot,
+    )
     return {"status": "ok"}
