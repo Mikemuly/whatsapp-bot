@@ -7,7 +7,16 @@ from google import genai
 from google.genai import types
 from groq import AsyncGroq
 
-from rag import format_context, retrieve_relevant_chunks
+from app.prompts import (
+    LEGAL_SYSTEM_PROMPT,
+    NO_RELEVANT_SOURCES_REPLY,
+    UNVERIFIED_CITATION_REPLY,
+)
+from rag import (
+    format_context,
+    has_supported_citation,
+    retrieve_relevant_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,23 +24,35 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 GROQ_DEFAULT_MODEL = "qwen/qwen3.8-27b"
 REQUEST_TIMEOUT_MS = 9000
 GROQ_TIMEOUT_SECONDS = 9.0
-SYSTEM_INSTRUCTION = (
-    "You provide concise information about the Constitution of Kenya, 2010. "
-    "Answer only from the provided excerpts; never use outside knowledge or "
-    "guess. Cite every factual claim with its Article and clause when "
-    "available. If the excerpts do not answer the question, say that the "
-    "Constitution excerpts do not provide the answer. Reply in the user's "
-    "language (English or Swahili), keep citations in their original form, "
-    "and keep the answer short for WhatsApp. End with: "
-    "This is information, not legal advice."
+SYSTEM_INSTRUCTION = LEGAL_SYSTEM_PROMPT
+Language = Literal["english", "swahili"]
+LANGUAGE_PICKER_REPLY = (
+    "Hi! I'm a Kenyan legal information assistant, not a lawyer. "
+    "I can also chat briefly. Please choose English, Kiswahili, or Other below."
 )
 FALLBACK_REPLY = (
     "Sorry, I'm having trouble responding right now. Please try again later."
 )
 INDEX_UNAVAILABLE_REPLY = (
-    "I can't access the Constitution reference right now. Please try again "
-    "later. This is information, not legal advice."
+    "I can't access the legal references right now. Please try again later. "
+    "This is legal information, not legal advice."
 )
+NO_RELEVANT_EXCERPTS_REPLY = NO_RELEVANT_SOURCES_REPLY
+
+GREETINGS = {
+    "hello",
+    "hi",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how are you",
+    "how are you doing",
+    "habari",
+    "hujambo",
+    "mambo",
+}
+THANKS = {"thanks", "thank you", "asante"}
 
 
 class ConversationMessage(TypedDict):
@@ -39,9 +60,40 @@ class ConversationMessage(TypedDict):
     content: str
 
 
+def is_small_talk_message(user_text: str) -> bool:
+    message = user_text.strip().casefold().rstrip("!?.")
+    return message in GREETINGS | THANKS
+
+
+def _small_talk_reply(user_text: str, language: Language | None) -> str | None:
+    message = user_text.strip().casefold().rstrip("!?.")
+    if not is_small_talk_message(user_text):
+        return None
+
+    if language is None:
+        return LANGUAGE_PICKER_REPLY
+    if message in THANKS:
+        if language == "swahili":
+            return "Karibu! Una swali lingine?"
+        return "You're welcome! What else can I help with?"
+    return (
+        "Habari! Ninaweza kukusaidiaje leo?"
+        if language == "swahili"
+        else "Hi! I'm doing well, thanks. What can I help you with today?"
+    )
+
+
+def _system_instruction(language: Language | None) -> str:
+    if language is None:
+        return SYSTEM_INSTRUCTION
+    requested_language = "Kiswahili" if language == "swahili" else "English"
+    return f"{SYSTEM_INSTRUCTION}\n\nReply in {requested_language}."
+
+
 async def ask_gemini(
     user_text: str,
     history: list[ConversationMessage] | None = None,
+    language: Language | None = None,
 ) -> str:
     client: genai.Client | None = None
     try:
@@ -64,7 +116,7 @@ async def ask_gemini(
             model=GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION
+                system_instruction=_system_instruction(language)
             ),
         )
         if not response.text:
@@ -84,11 +136,12 @@ async def ask_gemini(
 async def ask_groq(
     user_text: str,
     history: list[ConversationMessage] | None = None,
+    language: Language | None = None,
 ) -> str:
     try:
         model = os.getenv("GROQ_MODEL", GROQ_DEFAULT_MODEL)
         messages = [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "system", "content": _system_instruction(language)},
             *[
                 {"role": message["role"], "content": message["content"]}
                 for message in history or []
@@ -116,22 +169,60 @@ async def ask_groq(
 async def get_ai_reply(
     user_text: str,
     history: list[ConversationMessage] | None = None,
+    case_mode: bool = False,
+    language: Language | None = None,
 ) -> str:
+    small_talk_reply = _small_talk_reply(user_text, language)
+    if small_talk_reply is not None:
+        return small_talk_reply
+
+    retrieval_query = user_text
+    if case_mode and history:
+        prior_facts = [
+            message["content"]
+            for message in history
+            if message["role"] == "user"
+        ]
+        retrieval_query = "\n".join([*prior_facts, user_text]).strip()
+
     try:
         retrieved_chunks = await asyncio.to_thread(
             retrieve_relevant_chunks,
-            user_text,
+            retrieval_query,
         )
     except Exception:
-        logger.exception("Failed to retrieve Constitution excerpts")
+        logger.exception("Failed to retrieve legal excerpts")
         return INDEX_UNAVAILABLE_REPLY
 
-    prompt = format_context(user_text, retrieved_chunks)
+    if not retrieved_chunks:
+        if case_mode:
+            return (
+                "I don't have relevant law for analysis in my current sources. "
+                "I can still help organize your facts without legal analysis. "
+                "What happened, and when? "
+                "Bado tuko free mode mkuu."
+            )
+        return NO_RELEVANT_EXCERPTS_REPLY
+
+    prompt = format_context(user_text, retrieved_chunks, case_mode=case_mode)
     provider = os.getenv("AI_PROVIDER", "groq").strip().lower()
     if provider == "groq":
-        return await ask_groq(prompt, history)
-    if provider == "gemini":
-        return await ask_gemini(prompt, history)
+        if language:
+            reply = await ask_groq(prompt, history, language)
+        else:
+            reply = await ask_groq(prompt, history)
+    elif provider == "gemini":
+        if language:
+            reply = await ask_gemini(prompt, history, language)
+        else:
+            reply = await ask_gemini(prompt, history)
+    else:
+        logger.error("Unsupported AI_PROVIDER: %s", provider)
+        return FALLBACK_REPLY
 
-    logger.error("Unsupported AI_PROVIDER: %s", provider)
-    return FALLBACK_REPLY
+    if reply == FALLBACK_REPLY:
+        return reply
+    if not has_supported_citation(reply, retrieved_chunks):
+        logger.warning("Generated reply did not contain verifiable citations")
+        return UNVERIFIED_CITATION_REPLY
+    return reply
