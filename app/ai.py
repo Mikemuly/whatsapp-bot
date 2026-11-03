@@ -6,6 +6,7 @@ from typing import Literal, TypedDict
 from google import genai
 from google.genai import types
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 from app.prompts import (
     LEGAL_SYSTEM_PROMPT,
@@ -22,8 +23,10 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 GROQ_DEFAULT_MODEL = "qwen/qwen3.8-27b"
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 REQUEST_TIMEOUT_MS = 9000
 GROQ_TIMEOUT_SECONDS = 9.0
+OPENAI_TIMEOUT_SECONDS = 9.0
 SYSTEM_INSTRUCTION = LEGAL_SYSTEM_PROMPT
 Language = Literal["english", "swahili"]
 LANGUAGE_PICKER_REPLY = (
@@ -166,6 +169,39 @@ async def ask_groq(
         return FALLBACK_REPLY
 
 
+async def ask_openai(
+    user_text: str,
+    history: list[ConversationMessage] | None = None,
+    language: Language | None = None,
+) -> str:
+    try:
+        model = os.getenv("OPENAI_MODEL", OPENAI_DEFAULT_MODEL)
+        messages = [
+            {"role": "system", "content": _system_instruction(language)},
+            *[
+                {"role": message["role"], "content": message["content"]}
+                for message in history or []
+            ],
+            {"role": "user", "content": user_text},
+        ]
+        async with AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=OPENAI_TIMEOUT_SECONDS,
+            max_retries=0,
+        ) as client:
+            completion = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+            )
+        reply = completion.choices[0].message.content
+        if not reply:
+            raise RuntimeError("OpenAI returned an empty response")
+        return reply
+    except Exception:
+        logger.exception("Failed to generate an OpenAI reply")
+        return FALLBACK_REPLY
+
+
 async def get_ai_reply(
     user_text: str,
     history: list[ConversationMessage] | None = None,
@@ -211,6 +247,11 @@ async def get_ai_reply(
             reply = await ask_groq(prompt, history, language)
         else:
             reply = await ask_groq(prompt, history)
+    elif provider == "openai":
+        if language:
+            reply = await ask_openai(prompt, history, language)
+        else:
+            reply = await ask_openai(prompt, history)
     elif provider == "gemini":
         if language:
             reply = await ask_gemini(prompt, history, language)

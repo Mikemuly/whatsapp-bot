@@ -8,11 +8,11 @@ for advice about their circumstances.
 
 ## Configuration and running
 
-Set `VERIFY_TOKEN`, `WHATSAPP_TOKEN`, `PHONE_NUMBER_ID`, `GROQ_API_KEY`, and
-`AI_PROVIDER=groq` in `.env` (use `.env.example` as a template). Groq uses
-`qwen/qwen3.8-27b` by default; set `GROQ_MODEL` to another model enabled for
-your account if needed. Set `AI_PROVIDER=gemini` and `GEMINI_API_KEY` to use
-Gemini instead.
+Set `VERIFY_TOKEN`, `WHATSAPP_TOKEN`, `PHONE_NUMBER_ID`, `OPENAI_API_KEY`, and
+`AI_PROVIDER=openai` in `.env` (use `.env.example` as a template). OpenAI uses
+`gpt-4o-mini` by default; set `OPENAI_MODEL` to another model enabled for your
+account if needed. Set `AI_PROVIDER=groq` and `GROQ_API_KEY` to use Groq, or
+`AI_PROVIDER=gemini` and `GEMINI_API_KEY` to use Gemini instead.
 
 Run the app with:
 

@@ -117,6 +117,67 @@ class GetAIReplyTests(unittest.IsolatedAsyncioTestCase):
         )
         client.__aexit__.assert_awaited_once()
 
+    @patch("app.ai.AsyncOpenAI")
+    async def test_ask_openai_returns_chat_completion_text(self, openai_factory):
+        client = openai_factory.return_value
+        client.__aenter__.return_value = client
+        client.chat.completions.create = AsyncMock(
+            return_value=Mock(
+                choices=[Mock(message=Mock(content="OpenAI reply"))]
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "test-openai-key", "OPENAI_MODEL": "test-model"},
+        ):
+            reply = await ai.ask_openai("Hi")
+
+        self.assertEqual(reply, "OpenAI reply")
+        openai_factory.assert_called_once_with(
+            api_key="test-openai-key",
+            timeout=ai.OPENAI_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs,
+            {
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": ai.SYSTEM_INSTRUCTION},
+                    {"role": "user", "content": "Hi"},
+                ],
+            },
+        )
+        client.__aexit__.assert_awaited_once()
+
+    @patch("app.ai.AsyncOpenAI")
+    async def test_ask_openai_includes_prior_conversation(self, openai_factory):
+        client = openai_factory.return_value
+        client.__aenter__.return_value = client
+        client.chat.completions.create = AsyncMock(
+            return_value=Mock(
+                choices=[Mock(message=Mock(content="Continuing reply"))]
+            )
+        )
+        history = [
+            {"role": "user", "content": "My name is Alex."},
+            {"role": "assistant", "content": "Nice to meet you, Alex."},
+        ]
+
+        reply = await ai.ask_openai("What is my name?", history)
+
+        self.assertEqual(reply, "Continuing reply")
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs["messages"],
+            [
+                {"role": "system", "content": ai.SYSTEM_INSTRUCTION},
+                *history,
+                {"role": "user", "content": "What is my name?"},
+            ],
+        )
+        client.__aexit__.assert_awaited_once()
+
     @patch("app.ai.genai.Client")
     async def test_ask_gemini_converts_prior_conversation(self, client_factory):
         client = client_factory.return_value
@@ -191,6 +252,46 @@ class GetAIReplyTests(unittest.IsolatedAsyncioTestCase):
             "Question with Article 43 context",
             [{"role": "user", "content": "Earlier"}],
         )
+        ask_gemini.assert_not_awaited()
+
+    async def test_dispatches_to_openai_provider(self):
+        with (
+            patch.dict(os.environ, {"AI_PROVIDER": "openai"}),
+            patch(
+                "app.ai.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=[
+                    {
+                        "text": "Article 43 excerpt",
+                        "source": "Constitution of Kenya, 2010",
+                        "section": "43",
+                        "article": "43",
+                        "title": "Economic and social rights",
+                        "chapter": "Four - The Bill of Rights",
+                        "clause": "1",
+                    }
+                ],
+            ),
+            patch(
+                "app.ai.format_context",
+                return_value="Question with Article 43 context",
+            ),
+            patch(
+                "app.ai.ask_openai",
+                new_callable=AsyncMock,
+                return_value="Article 43(1) applies.",
+            ) as ask_openai,
+            patch("app.ai.ask_groq", new_callable=AsyncMock) as ask_groq,
+            patch("app.ai.ask_gemini", new_callable=AsyncMock) as ask_gemini,
+        ):
+            reply = await ai.get_ai_reply("What does Article 43 protect?")
+
+        self.assertEqual(reply, "Article 43(1) applies.")
+        ask_openai.assert_awaited_once_with(
+            "Question with Article 43 context",
+            None,
+        )
+        ask_groq.assert_not_awaited()
         ask_gemini.assert_not_awaited()
 
     async def test_returns_clear_reply_when_constitution_index_unavailable(self):
